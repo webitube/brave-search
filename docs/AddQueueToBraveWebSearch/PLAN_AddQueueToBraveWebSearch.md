@@ -1,6 +1,17 @@
--## Plan: Add Request Queue to Brave Web Search + Refactor + Unit Tests
+# Plan: Add Request Queue to Brave Web Search + Refactor + Unit Tests
+
+**Status:** ⏳ **In Progress** — Persistent rate-limit store completed. Queue, refactor, and Vitest migration pending.
 
 **TL;DR:** Replace the reactive `checkRateLimit()` guard in `brave_web_search` with an async request queue that serializes API calls with a configurable delay between them. While doing so, refactor the monolithic index.ts into a clean module structure (`src/tools/`, `src/queue/`, `src/types/`, `src/config/`) and introduce **Vitest** as the unit test framework with tests for the queue and tool logic.
+
+### Completed (via Persistent Rate Limiting plan)
+
+- [x] `src/rate-limit-store.ts` — File-backed persistent rate-limit store
+- [x] `tests/rate-limit-store.test.ts` — Unit tests (Node.js built-in test runner)
+- [x] Graceful shutdown with state flush
+- [x] Configurable rate limits via environment variables
+
+### Remaining Work
 
 ---
 
@@ -8,9 +19,12 @@
 
 **Goal:** Establish the foundation (test runner, folder layout) before any code changes.
 
+> **Note:** The project currently uses Node.js built-in test runner. This phase migrates to Vitest for better ESM/TypeScript support and fake timers.
+
 1. **Add Vitest and test utilities to `devDependencies`** in package.json
    - Add `vitest` and `@vitest/coverage-v8` to devDependencies
    - Add `"test": "vitest"` and `"test:run": "vitest run"` scripts
+   - Migrate existing `tests/rate-limit-store.test.ts` from Node.js test runner to Vitest
 
 2. **Create `vitest.config.ts`** at project root
    - Configure ESM mode, `test.environment: 'node'`, globals off
@@ -21,7 +35,7 @@
    - `src/queue/` — request queue implementation
    - `src/types/` — shared TypeScript interfaces
    - `src/config/` — environment config and constants
-   - `test/` — unit tests
+   - `test/` — unit tests (rename from `tests/`)
 
 4. **Update tsconfig.json**
    - Change `rootDir` from `"."` to `"./src"`
@@ -136,13 +150,22 @@
 ### Files to modify
 | File | Change |
 |---|---|
-| index.ts | Rewrite as thin entry point importing from `src/` |
-| package.json | Add Vitest devDependencies and test scripts |
-| tsconfig.json | Update `rootDir` to `./src` |
-| README.md | Document `QUEUE_DELAY_MS` |
+| `index.ts` | Rewrite as thin entry point importing from `src/` |
+| `src/rate-limit-store.ts` | Update imports if config is extracted to `src/config/env.ts` |
+| `tests/rate-limit-store.test.ts` | Migrate from Node.js test runner to Vitest, move to `test/` |
+| `package.json` | Add Vitest devDependencies and test scripts |
+| `tsconfig.json` | Update `rootDir` to `./src` |
+| `README.md` | Document `QUEUE_DELAY_MS` |
+
+### Files already created (from Persistent Rate Limiting plan)
+| File | Status |
+|---|---|
+| `src/rate-limit-store.ts` | ✅ Completed |
+| `tests/rate-limit-store.test.ts` | ✅ Completed (needs Vitest migration) |
 
 ### Key decisions
-- **Vitest** over Jest — ESM-native, zero-config for TypeScript, excellent `vi.useFakeTimers()` for queue delay testing
+- **Vitest** over Jest — ESM-native, zero-config for TypeScript, excellent `vi.useFakeTimers()` for queue delay testing. Will replace Node.js built-in test runner.
 - **Queue replaces `checkRateLimit()`** — serializes with guaranteed spacing vs. the current counter which allows bursts
 - **All API calls go through the queue** — not just web search, for consistency
 - **`src/` directory structure** — standardizes the project and keeps test files out of `dist/`
+- **Existing `src/rate-limit-store.ts` will be preserved** — the persistent store provides value (survives restarts); the queue adds serialization on top
