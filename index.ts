@@ -156,11 +156,16 @@ interface BraveLocation {
 }
 
 interface BravePoiResponse {
-  results: BraveLocation[];
+  type?: string;
+  results?: BraveLocation[];
 }
 
 interface BraveDescription {
-  descriptions: {[id: string]: string};
+  type?: string;
+  results?: Array<{
+    id: string;
+    description?: string;
+  }>;
 }
 
 function isBraveWebSearchArgs(args: unknown): args is { query: string; count?: number } {
@@ -238,7 +243,8 @@ async function performLocalSearch(query: string, count: number = 5) {
 
   const webData = await webResponse.json() as BraveWeb;
   increment();
-  const locationIds = webData.locations?.results?.filter((r): r is {id: string; title?: string} => r.id != null).map(r => r.id) || [];
+  const locationResults = webData.locations?.results?.filter((r): r is {id: string; title?: string} => r.id != null) || [];
+  const locationIds = locationResults.map(r => r.id);
 
   if (locationIds.length === 0) {
     // Fallback to web search — wait for rate limit window before retrying
@@ -246,19 +252,68 @@ async function performLocalSearch(query: string, count: number = 5) {
     return performWebSearch(query, count);
   }
 
-  // Wait for rate limit window before making additional requests
-  await new Promise(resolve => setTimeout(resolve, DEFAULT_REQUEST_DELAY_MS));
+  // Try to enrich with POI data, but use location data as primary source
+  const poiMap: {[id: string]: BraveLocation} = {};
+  const descMap: {[id: string]: string} = {};
 
-  // Get POI details and descriptions in parallel
-  const [poisData, descriptionsData] = await Promise.all([
-    getPoisData(locationIds),
-    getDescriptionsData(locationIds)
-  ]);
+  try {
+    // Batch IDs into chunks of 20 (Brave API limit)
+    const MAX_IDS_PER_REQUEST = 20;
+    const batches: string[][] = [];
+    for (let i = 0; i < locationIds.length; i += MAX_IDS_PER_REQUEST) {
+      batches.push(locationIds.slice(i, i + MAX_IDS_PER_REQUEST));
+    }
 
-  return formatLocalResults(poisData, descriptionsData);
+    for (const batch of batches) {
+      await new Promise(resolve => setTimeout(resolve, DEFAULT_REQUEST_DELAY_MS));
+
+      const [poisData, descriptionsData] = await Promise.all([
+        getPoisData(batch),
+        getDescriptionsData(batch)
+      ]);
+
+      // POI response is { results: [...] }
+      for (const poi of poisData.results || []) {
+        if (poi.id) {
+          poiMap[poi.id] = poi;
+        }
+      }
+
+      // Descriptions response is { results: [{ id, description }] }
+      for (const desc of descriptionsData.results || []) {
+        if (desc.id && desc.description) {
+          descMap[desc.id] = desc.description;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Warning: Failed to enrich with POI data:', err);
+  }
+
+  // Build results using location data, enriched with POI data where available
+  const results: {[id: string]: BraveLocation} = {};
+  for (const loc of locationResults) {
+    const poi = poiMap[loc.id];
+    if (poi && poi.name) {
+      results[loc.id] = poi;
+    } else {
+      results[loc.id] = {
+        id: loc.id,
+        name: loc.title || 'Unknown',
+        address: {},
+        phone: '',
+        rating: { ratingValue: 0, ratingCount: 0 },
+        openingHours: [],
+        priceRange: ''
+      };
+    }
+  }
+
+  return formatLocalResults(results, descMap);
 }
 
 async function getPoisData(ids: string[]): Promise<BravePoiResponse> {
+  checkRateLimit();
   const url = new URL('https://api.search.brave.com/res/v1/local/pois');
   ids.filter(Boolean).forEach(id => url.searchParams.append('ids', id));
   const response = await fetch(url, {
@@ -279,6 +334,7 @@ async function getPoisData(ids: string[]): Promise<BravePoiResponse> {
 }
 
 async function getDescriptionsData(ids: string[]): Promise<BraveDescription> {
+  checkRateLimit();
   const url = new URL('https://api.search.brave.com/res/v1/local/descriptions');
   ids.filter(Boolean).forEach(id => url.searchParams.append('ids', id));
   const response = await fetch(url, {
@@ -298,8 +354,8 @@ async function getDescriptionsData(ids: string[]): Promise<BraveDescription> {
   return descriptionsData;
 }
 
-function formatLocalResults(poisData: BravePoiResponse, descData: BraveDescription): string {
-  return (poisData.results || []).map(poi => {
+function formatLocalResults(poisMap: {[id: string]: BraveLocation}, descMap: {[id: string]: string}): string {
+  return Object.values(poisMap).map(poi => {
     const address = [
       poi.address?.streetAddress ?? '',
       poi.address?.addressLocality ?? '',
@@ -313,7 +369,7 @@ Phone: ${poi.phone || 'N/A'}
 Rating: ${poi.rating?.ratingValue ?? 'N/A'} (${poi.rating?.ratingCount ?? 0} reviews)
 Price Range: ${poi.priceRange || 'N/A'}
 Hours: ${(poi.openingHours || []).join(', ') || 'N/A'}
-Description: ${descData.descriptions[poi.id] || 'No description available'}
+Description: ${descMap[poi.id] || 'No description available'}
 `;
   }).join('\n---\n') || 'No local results found';
 }
