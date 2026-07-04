@@ -26,6 +26,17 @@ An MCP server implementation that integrates the Brave Search API, providing bot
     - `count` (number, optional): Number of results (max 20)
   - Automatically falls back to web search if no local results found
 
+## Transport Modes
+
+The server supports two transport modes:
+
+| Mode | Description | Use Case |
+|---|---|---|
+| **stdio** (default) | Communicates over standard input/output | Claude Desktop, VS Code MCP clients, any stdio-based MCP client |
+| **SSE** | HTTP server with Server-Sent Events | Reverse proxy deployments, browser-based clients |
+
+Set the mode via the `MCP_TRANSPORT` environment variable (`stdio` or `sse`). Defaults to `stdio`.
+
 ## Configuration
 
 ### Getting an API Key

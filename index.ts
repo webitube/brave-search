@@ -2,12 +2,14 @@
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import express, { Request, Response } from "express";
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
+import { increment, getMonthCount, flush, startFlushTimer, stopFlushTimer, getRemainingQuota, getTimeSinceLastRequest, recordSuccess } from "./src/rate-limit-store.js";
 
 const WEB_SEARCH_TOOL: Tool = {
   name: "brave_web_search",
@@ -86,29 +88,30 @@ if (!BRAVE_API_KEY) {
   process.exit(1);
 }
 
-const RATE_LIMIT = {
-  perSecond: 1,
-  perMonth: 15000
-};
-
-let requestCount = {
-  second: 0,
-  month: 0,
-  lastReset: Date.now()
-};
+const DEFAULT_REQUEST_DELAY_MS = 1000;
+const DEFAULT_RATE_LIMIT_PER_MONTH = 1000;
+const DEFAULT_FLUSH_INTERVAL_MS = 5000;
+const BASE_10 = 10;
+const RATE_LIMIT_PER_MONTH = parseInt(process.env.RATE_LIMIT_PER_MONTH ?? DEFAULT_RATE_LIMIT_PER_MONTH.toString(), BASE_10);
+const RATE_LIMIT_FLUSH_INTERVAL_MS = parseInt(process.env.RATE_LIMIT_FLUSH_INTERVAL_MS ?? DEFAULT_FLUSH_INTERVAL_MS.toString(), BASE_10);
 
 function checkRateLimit() {
-  const now = Date.now();
-  if (now - requestCount.lastReset > 1000) {
-    requestCount.second = 0;
-    requestCount.lastReset = now;
+  const elapsedSinceLastRequest = getTimeSinceLastRequest();
+  const exceededPerSecond = elapsedSinceLastRequest < DEFAULT_REQUEST_DELAY_MS;
+  const exceededPerMonth = getMonthCount() >= RATE_LIMIT_PER_MONTH;
+
+  if (exceededPerSecond || exceededPerMonth) {
+    const reasons = [];
+    if (exceededPerSecond) {
+      const waitMs = DEFAULT_REQUEST_DELAY_MS - elapsedSinceLastRequest;
+      reasons.push(`per-second limit: please wait ${waitMs}ms before next request`);
+    }
+    if (exceededPerMonth) {
+      const remaining = getRemainingQuota(RATE_LIMIT_PER_MONTH);
+      reasons.push(`per-month limit: ${getMonthCount()}/${RATE_LIMIT_PER_MONTH} (${remaining} requests remaining this month)`);
+    }
+    throw new Error(`RON: Rate limit exceeded: ${reasons.join(', ')} <--RON`);
   }
-  if (requestCount.second >= RATE_LIMIT.perSecond ||
-    requestCount.month >= RATE_LIMIT.perMonth) {
-    throw new Error('Rate limit exceeded');
-  }
-  requestCount.second++;
-  requestCount.month++;
 }
 
 interface BraveWeb {
@@ -198,6 +201,7 @@ async function performWebSearch(query: string, count: number = 10, offset: numbe
   }
 
   const data = await response.json() as BraveWeb;
+  increment();
 
   // Extract just web results
   const results = (data.web?.results || []).map(result => ({
@@ -233,11 +237,17 @@ async function performLocalSearch(query: string, count: number = 5) {
   }
 
   const webData = await webResponse.json() as BraveWeb;
+  increment();
   const locationIds = webData.locations?.results?.filter((r): r is {id: string; title?: string} => r.id != null).map(r => r.id) || [];
 
   if (locationIds.length === 0) {
-    return performWebSearch(query, count); // Fallback to web search
+    // Fallback to web search — wait for rate limit window before retrying
+    await new Promise(resolve => setTimeout(resolve, DEFAULT_REQUEST_DELAY_MS));
+    return performWebSearch(query, count);
   }
+
+  // Wait for rate limit window before making additional requests
+  await new Promise(resolve => setTimeout(resolve, DEFAULT_REQUEST_DELAY_MS));
 
   // Get POI details and descriptions in parallel
   const [poisData, descriptionsData] = await Promise.all([
@@ -249,7 +259,6 @@ async function performLocalSearch(query: string, count: number = 5) {
 }
 
 async function getPoisData(ids: string[]): Promise<BravePoiResponse> {
-  checkRateLimit();
   const url = new URL('https://api.search.brave.com/res/v1/local/pois');
   ids.filter(Boolean).forEach(id => url.searchParams.append('ids', id));
   const response = await fetch(url, {
@@ -265,11 +274,11 @@ async function getPoisData(ids: string[]): Promise<BravePoiResponse> {
   }
 
   const poisResponse = await response.json() as BravePoiResponse;
+  increment();
   return poisResponse;
 }
 
 async function getDescriptionsData(ids: string[]): Promise<BraveDescription> {
-  checkRateLimit();
   const url = new URL('https://api.search.brave.com/res/v1/local/descriptions');
   ids.filter(Boolean).forEach(id => url.searchParams.append('ids', id));
   const response = await fetch(url, {
@@ -285,6 +294,7 @@ async function getDescriptionsData(ids: string[]): Promise<BraveDescription> {
   }
 
   const descriptionsData = await response.json() as BraveDescription;
+  increment();
   return descriptionsData;
 }
 
@@ -365,21 +375,53 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 });
 
-// SSE Server
-const app = express();
-app.use(express.json());
-let transport: SSEServerTransport;
+// Start server - supports both stdio and SSE transports
+// Use MCP_TRANSPORT=stdio for stdio mode (default), or MCP_TRANSPORT=sse for HTTP/SSE mode
+const transportMode = (process.env.MCP_TRANSPORT || "stdio").toLowerCase();
 
-app.get("/sse", async (req: Request, res: Response) => {
-  transport = new SSEServerTransport("/message", res);
-  await server.connect(transport);
-});
+async function startServer() {
+  if (transportMode === "sse") {
+    const app = express();
+    app.use(express.json());
+    let transport: SSEServerTransport;
 
-app.post("/message", async (req: Request, res: Response) => {
-  await transport.handlePostMessage(req, res);
-});
+    app.get("/sse", async (req: Request, res: Response) => {
+      transport = new SSEServerTransport("/message", res);
+      await server.connect(transport);
+    });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Brave Search MCP Server running on SSE at port ${PORT}`);
+    app.post("/message", async (req: Request, res: Response) => {
+      await transport.handlePostMessage(req, res);
+    });
+
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.error(`Brave Search MCP Server running on SSE at port ${PORT}`);
+    });
+  } else {
+    // Default: stdio transport
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+    console.error("Brave Search MCP Server running on stdio");
+  }
+}
+
+// Start flush timer for periodic persistence
+startFlushTimer(RATE_LIMIT_FLUSH_INTERVAL_MS);
+
+// Graceful shutdown handler
+function gracefulShutdown(signal: string) {
+  console.error(`Received ${signal}, flushing rate limit state...`);
+  stopFlushTimer();
+  flush();
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
+startServer().catch(error => {
+  console.error("Failed to start server:", error);
+  stopFlushTimer();
+  process.exit(1);
 });

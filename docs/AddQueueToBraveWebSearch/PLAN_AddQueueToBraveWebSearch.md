@@ -1,4 +1,4 @@
-## Plan: Add Request Queue to Brave Web Search + Refactor + Unit Tests
+-## Plan: Add Request Queue to Brave Web Search + Refactor + Unit Tests
 
 **TL;DR:** Replace the reactive `checkRateLimit()` guard in `brave_web_search` with an async request queue that serializes API calls with a configurable delay between them. While doing so, refactor the monolithic index.ts into a clean module structure (`src/tools/`, `src/queue/`, `src/types/`, `src/config/`) and introduce **Vitest** as the unit test framework with tests for the queue and tool logic.
 
