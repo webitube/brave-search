@@ -53,10 +53,11 @@ flowchart LR
 
 | Component | Description |
 |---|---|
-| `index.ts` | Entry point — Express server, SSE transport, MCP tool routing |
-| `@modelcontextprotocol/sdk` | MCP protocol implementation (SSE transport) |
+| `index.ts` | Entry point — Express server, SSE transport, MCP tool routing, rate-limit integration |
+| `src/rate-limit-store.ts` | Persistent rate-limit store (file-backed JSON, periodic flush) |
+| `tests/rate-limit-store.test.ts` | Unit tests for the rate-limit store |
+| `@modelcontextprotocol/sdk` | MCP protocol implementation (stdio + SSE transports) |
 | Brave Search API | External API for web and local search queries |
-| Rate Limiter | In-memory counter (1 req/s, 15,000 req/month) |
 
 ### Ports
 
@@ -232,9 +233,8 @@ The project uses GitHub Actions for CI. The workflow is defined in `.github/work
 
 | Stage | Description |
 |---|---|
-| **Lint** | TypeScript type checking via `tsc --noEmit` |
 | **Build** | Full TypeScript compilation (`npm run build`) |
-| **Test** | Unit tests (Vitest — planned per [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md)) |
+| **Test** | Unit tests via Node.js built-in test runner (`npm test`) |
 | **Docker Build** | Multi-stage Docker image build validation |
 
 #### Triggering the Pipeline
@@ -257,7 +257,10 @@ Navigate to the **Actions** tab in the GitHub repository to view workflow runs, 
 | `MCP_TRANSPORT` | No | `stdio` | Transport mode: `stdio` (default) or `sse` |
 | `PORT` | No | `3000` | HTTP server listening port (only used when `MCP_TRANSPORT=sse`) |
 | `NODE_ENV` | No | `development` | Node environment (`production` in Docker) |
-| `QUEUE_DELAY_MS` | No | `1000` | Delay between queued API calls (ms) — planned feature |
+| `RATE_LIMIT_PER_MONTH` | No | `1000` | Maximum API requests per month |
+| `RATE_LIMIT_REQUEST_DELAY_MS` | No | `1000` | Minimum delay between requests (ms) |
+| `RATE_LIMIT_FLUSH_INTERVAL_MS` | No | `5000` | How often to flush rate-limit state to disk (ms) |
+| `RATE_LIMIT_STATE_FILE` | No | `.rate-limit-state.json` | Path to the persistent rate-limit state file |
 
 > **Security Note:** Never commit `BRAVE_API_KEY` to version control. Use environment variables, secret managers, or IDE password fields.
 
@@ -319,14 +322,16 @@ curl -i http://localhost:3000/sse
 
 ### Rate Limiting
 
-The server enforces client-side rate limits:
+The server enforces client-side rate limits using a persistent, file-backed store (`src/rate-limit-store.ts`):
 
-| Limit | Value |
-|---|---|
-| Per second | 1 request |
-| Per month | 15,000 requests |
+| Limit | Value | Configurable |
+|---|---|---|
+| Per second | 1 request (1000ms delay) | `RATE_LIMIT_REQUEST_DELAY_MS` |
+| Per month | 1,000 requests (default) | `RATE_LIMIT_PER_MONTH` |
 
-> **Note:** Rate limiting is currently in-memory. In a multi-instance deployment, consider distributed rate limiting (Redis, etc.).
+The state is persisted to `.rate-limit-state.json` and flushed periodically (default: every 5 seconds, configurable via `RATE_LIMIT_FLUSH_INTERVAL_MS`). On graceful shutdown (SIGTERM/SIGINT), the state is flushed before exit.
+
+> **Note:** Rate limiting is single-instance. In a multi-instance deployment, consider distributed rate limiting (Redis, etc.).
 
 ### Logging
 
@@ -401,8 +406,9 @@ The project uses semantic versioning (`MAJOR.MINOR.PATCH`) as defined in `packag
 
 The following DevOps improvements are tracked in the project docs:
 
-- [ ] Add Vitest test framework (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md))
-- [ ] Add request queue for rate limiting (replaces in-memory counter)
-- [ ] Refactor monolithic `index.ts` into modular `src/` structure
+- [x] Add persistent rate-limit store (file-backed, replaces in-memory counter)
+- [x] Add unit tests (Node.js built-in test runner)
+- [ ] Add request queue for rate limiting (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md))
+- [ ] Refactor monolithic `index.ts` into modular `src/` structure (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md))
 - [ ] Add structured logging (Winston/Pino)
 - [ ] Add Docker healthcheck endpoint

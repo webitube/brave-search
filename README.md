@@ -8,6 +8,7 @@ An MCP server implementation that integrates the Brave Search API, providing bot
 - **Local Search**: Find businesses, restaurants, and services with detailed information
 - **Flexible Filtering**: Control result types, safety levels, and content freshness
 - **Smart Fallbacks**: Local search automatically falls back to web when no results are found
+- **Persistent Rate Limiting**: File-backed rate-limit store that survives restarts, with configurable limits
 
 ## Tools
 
@@ -25,6 +26,24 @@ An MCP server implementation that integrates the Brave Search API, providing bot
     - `query` (string): Local search terms
     - `count` (number, optional): Number of results (max 20)
   - Automatically falls back to web search if no local results found
+
+## Configuration
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `BRAVE_API_KEY` | **Yes** | — | Brave Search API subscription token |
+| `MCP_TRANSPORT` | No | `stdio` | Transport mode: `stdio` (default) or `sse` |
+| `PORT` | No | `3000` | HTTP server listening port (SSE mode only) |
+| `RATE_LIMIT_PER_MONTH` | No | `1000` | Maximum API requests per month |
+| `RATE_LIMIT_REQUEST_DELAY_MS` | No | `1000` | Minimum delay between requests (ms) |
+| `RATE_LIMIT_FLUSH_INTERVAL_MS` | No | `5000` | How often to flush rate-limit state to disk (ms) |
+| `RATE_LIMIT_STATE_FILE` | No | `.rate-limit-state.json` | Path to the persistent rate-limit state file |
+
+### Rate Limiting
+
+The server uses a persistent, file-backed rate-limit store that survives restarts. State is flushed periodically (default: every 5 seconds) and on graceful shutdown.
 
 ## Transport Modes
 

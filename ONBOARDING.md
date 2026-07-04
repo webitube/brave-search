@@ -102,6 +102,7 @@ curl -i http://localhost:3000/sse
 | **Protocol** | `@modelcontextprotocol/sdk` | MCP protocol implementation (stdio + SSE transports) |
 | **HTTP Server** | Express 4.x | SSE transport layer (when `MCP_TRANSPORT=sse`) |
 | **External API** | Brave Search API | Web and local search |
+| **Testing** | Node.js built-in test runner | Unit tests for rate-limit store |
 | **Container** | Docker (Alpine) | Production deployment |
 | **CI/CD** | GitHub Actions | Automated build & test |
 
@@ -115,9 +116,15 @@ brave-search/
 │   └── workflows/
 │       └── ci.yml              # GitHub Actions CI pipeline
 ├── docs/
-│   └── AddQueueToBraveWebSearch/
-│       ├── FEAT_AddQueueToBraveWebSearch.md    # Feature spec
-│       └── PLAN_AddQueueToBraveWebSearch.md    # Implementation plan
+│   ├── AddQueueToBraveWebSearch/
+│   │   ├── FEAT_AddQueueToBraveWebSearch.md    # Feature spec
+│   │   └── PLAN_AddQueueToBraveWebSearch.md    # Implementation plan
+│   └── PersistentRateLimiting/
+│       └── PLAN_PersistentRateLimiting.md      # Persistent rate-limit plan (completed)
+├── src/
+│   └── rate-limit-store.ts     # Persistent rate-limit store (file-backed)
+├── tests/
+│   └── rate-limit-store.test.ts # Unit tests for rate-limit store
 ├── .gitignore
 ├── Dockerfile                  # Multi-stage Docker build
 ├── index.ts                    # Main entry point (server + tools)
@@ -132,10 +139,12 @@ brave-search/
 
 | File | What to Know |
 |---|---|
-| `index.ts` | **Main file** — Contains server setup, tool definitions, API calls, and result formatting |
+| `index.ts` | **Main file** — Contains server setup, tool definitions, API calls, rate-limit integration, and result formatting |
+| `src/rate-limit-store.ts` | Persistent rate-limit store — file-backed JSON with periodic flush |
+| `tests/rate-limit-store.test.ts` | Unit tests for the rate-limit store (Node.js built-in test runner) |
 | `Dockerfile` | Two-stage build: builder (full deps + compile) → release (production only) |
 | `tsconfig.json` | TypeScript config — targets ES2020, outputs to `dist/` |
-| `package.json` | Scripts: `build`, `start`; dependencies listed |
+| `package.json` | Scripts: `build`, `start`, `test`; dependencies listed |
 
 ---
 
@@ -181,14 +190,16 @@ We follow [Conventional Commits](https://www.conventionalcommits.org/):
 
 The file is organized in this order:
 
-1. **Tool Definitions** — `WEB_SEARCH_TOOL` and `LOCAL_SEARCH_TOOL` objects (MCP schema)
-2. **Server Setup** — MCP server creation with tool capabilities
-3. **API Key Validation** — Checks `BRAVE_API_KEY` at startup
-4. **Rate Limiting** — In-memory counter (1 req/s, 15,000 req/month)
-5. **Type Interfaces** — `BraveWeb`, `BraveLocation`, etc.
-6. **Search Functions** — `performWebSearch()`, `performLocalSearch()`, helper functions
-7. **Tool Handlers** — MCP request handlers (`ListToolsRequestSchema`, `CallToolRequestSchema`)
-8. **Transport Router** — Detects `MCP_TRANSPORT` env var; starts stdio transport (default) or SSE/Express server
+1. **Imports** — MCP SDK, Express, and the persistent rate-limit store (`src/rate-limit-store.ts`)
+2. **Tool Definitions** — `WEB_SEARCH_TOOL` and `LOCAL_SEARCH_TOOL` objects (MCP schema)
+3. **Server Setup** — MCP server creation with tool capabilities
+4. **API Key Validation** — Checks `BRAVE_API_KEY` at startup
+5. **Rate Limiting** — File-backed persistent store (configurable per-month limit, per-second delay)
+6. **Type Interfaces** — `BraveWeb`, `BraveLocation`, etc.
+7. **Search Functions** — `performWebSearch()`, `performLocalSearch()`, helper functions
+8. **Tool Handlers** — MCP request handlers (`ListToolsRequestSchema`, `CallToolRequestSchema`)
+9. **Transport Router** — Detects `MCP_TRANSPORT` env var; starts stdio transport (default) or SSE/Express server
+10. **Graceful Shutdown** — Flushes rate-limit state on SIGTERM/SIGINT
 
 ### Data Flow
 
@@ -205,7 +216,7 @@ flowchart TD
 
 - **Dual Transport** — The server auto-detects the transport mode from `MCP_TRANSPORT`. stdio is the default (for MCP clients); SSE is available for HTTP-based deployments
 - **Tool Schema** — Each tool defines its name, description, and input parameters (JSON Schema)
-- **Rate Limiting** — Prevents exceeding Brave API quotas (currently in-memory)
+- **Persistent Rate Limiting** — Prevents exceeding Brave API quotas using a file-backed store (`src/rate-limit-store.ts`). State is flushed periodically and on graceful shutdown. Configurable via `RATE_LIMIT_PER_MONTH`, `RATE_LIMIT_REQUEST_DELAY_MS`, and other env vars
 - **stderr Logging** — All startup/status messages go to stderr to keep stdout clean for JSONRPC protocol communication
 
 ---
@@ -274,17 +285,25 @@ async function performImageSearch(query: string, count: number = 10) {
 
 ### Current State
 
-The project currently does not have a test framework configured. Adding tests is a planned improvement (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md)).
+The project uses Node.js's built-in test runner (`node --test`) for unit tests. Tests are located in `tests/`.
 
-### Planned Test Setup
+### Running Tests
 
-- **Framework:** Vitest
-- **Location:** `test/` directory
-- **Coverage:** Queue logic, tool argument validation, API error handling
+```bash
+# Run all tests
+npm test
 
-### Manual Testing
+# The test command runs: node --test dist/tests/*.test.js
+```
 
-Until automated tests are added, test manually:
+### Current Test Coverage
+
+- **Rate Limit Store** (`tests/rate-limit-store.test.ts`) — Tests for `increment()`, `flush()`, `loadState()`, `getRemainingQuota()`, timer management, and state persistence
+
+### Planned Test Improvements
+
+- **Framework:** Vitest (planned per [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md))
+- **Additional Coverage:** Queue logic, tool argument validation, API error handling
 
 ```bash
 # Start the server
@@ -353,9 +372,9 @@ Edit `tsconfig.json` — key settings:
 
 ## FAQ
 
-### Q: Why is everything in `index.ts`?
+### Q: Why is most of the code in `index.ts`?
 
-The project started as a single-file implementation. A refactor into a modular `src/` structure is planned (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md), Phase 2).
+The project started as a single-file implementation. The rate-limit store has been extracted to `src/rate-limit-store.ts`. A full refactor into a modular `src/` structure (tools, queue, types, config) is planned (see [PLAN_AddQueueToBraveWebSearch.md](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md), Phase 2).
 
 ### Q: Can I run this without Docker?
 
@@ -372,7 +391,7 @@ Sign up at [brave.com/search/api/](https://brave.com/search/api/) and generate a
 
 ### Q: How does the rate limiter work?
 
-An in-memory counter tracks requests per second (max 1) and per month (max 15,000). This is a client-side safeguard — the Brave API also enforces its own limits.
+A file-backed persistent store (`src/rate-limit-store.ts`) tracks requests per second (configurable delay, default 1000ms) and per month (default 1,000, configurable via `RATE_LIMIT_PER_MONTH`). State is persisted to `.rate-limit-state.json` and flushed periodically. This is a client-side safeguard — the Brave API also enforces its own limits.
 
 ### Q: What's the difference between stdio and SSE transport?
 
@@ -389,6 +408,7 @@ MCP's stdio transport uses stdout for JSONRPC protocol messages. Any non-JSON te
 
 1. ✅ Read this onboarding guide
 2. ✅ Set up your local environment
-3. 🔲 Explore `index.ts` and trace a search request end-to-end
-4. 🔲 Pick a task from the [planned features](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md) or propose your own
-5. 🔲 Create a feature branch and start coding!
+3. 🔲 Explore `index.ts` and `src/rate-limit-store.ts` to understand the architecture
+4. 🔲 Run the test suite: `npm test`
+5. 🔲 Pick a task from the [planned features](./docs/AddQueueToBraveWebSearch/PLAN_AddQueueToBraveWebSearch.md) or propose your own
+6. 🔲 Create a feature branch and start coding!
